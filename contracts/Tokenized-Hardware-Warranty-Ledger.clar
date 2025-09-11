@@ -6,9 +6,15 @@
 (define-constant err-invalid-warranty (err u104))
 (define-constant err-already-exists (err u105))
 
+(define-constant err-not-certified (err u106))
+(define-constant err-job-not-available (err u107))
+(define-constant err-invalid-bid (err u108))
+
 (define-non-fungible-token warranty-token uint)
 
 (define-data-var warranty-counter uint u0)
+
+(define-data-var job-counter uint u0)
 
 (define-map warranties
   { warranty-id: uint }
@@ -31,6 +37,38 @@
     to-owner: principal,
     transfer-date: uint,
     reason: (string-ascii 100)
+  }
+)
+
+(define-map service-providers
+  { provider: principal }
+  {
+    certification-level: uint,
+    reputation-score: uint,
+    total-jobs: uint,
+    is-active: bool
+  }
+)
+
+(define-map repair-jobs
+  { job-id: uint }
+  {
+    warranty-id: uint,
+    customer: principal,
+    description: (string-ascii 200),
+    max-budget: uint,
+    status: (string-ascii 20),
+    selected-provider: (optional principal),
+    completion-block: (optional uint)
+  }
+)
+
+(define-map service-bids
+  { job-id: uint, provider: principal }
+  {
+    bid-amount: uint,
+    estimated-duration: uint,
+    bid-block: uint
   }
 )
 
@@ -194,5 +232,77 @@
     )
     (var-set warranty-counter warranty-id)
     warranty-id
+  )
+)
+
+(define-public (register-service-provider (certification-level uint))
+  (begin
+    (asserts! (not (is-some (map-get? service-providers { provider: tx-sender }))) err-already-exists)
+    (asserts! (>= certification-level u1) err-invalid-warranty)
+    (map-set service-providers
+      { provider: tx-sender }
+      {
+        certification-level: certification-level,
+        reputation-score: u100,
+        total-jobs: u0,
+        is-active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (post-repair-job (warranty-id uint) (description (string-ascii 200)) (max-budget uint))
+  (let ((warranty-data (unwrap! (get-warranty warranty-id) err-not-found))
+        (job-id (+ (var-get job-counter) u1)))
+    (asserts! (is-eq tx-sender (get owner warranty-data)) err-unauthorized)
+    (asserts! (get is-active warranty-data) err-invalid-warranty)
+    (asserts! (> max-budget u0) err-invalid-warranty)
+    (map-set repair-jobs
+      { job-id: job-id }
+      {
+        warranty-id: warranty-id,
+        customer: tx-sender,
+        description: description,
+        max-budget: max-budget,
+        status: "open",
+        selected-provider: none,
+        completion-block: none
+      }
+    )
+    (var-set job-counter job-id)
+    (ok job-id)
+  )
+)
+
+(define-public (submit-service-bid (job-id uint) (bid-amount uint) (estimated-duration uint))
+  (let ((job-data (unwrap! (map-get? repair-jobs { job-id: job-id }) err-not-found))
+        (provider-data (unwrap! (map-get? service-providers { provider: tx-sender }) err-not-certified)))
+    (asserts! (get is-active provider-data) err-not-certified)
+    (asserts! (is-eq (get status job-data) "open") err-job-not-available)
+    (asserts! (<= bid-amount (get max-budget job-data)) err-invalid-bid)
+    (asserts! (> estimated-duration u0) err-invalid-bid)
+    (map-set service-bids
+      { job-id: job-id, provider: tx-sender }
+      {
+        bid-amount: bid-amount,
+        estimated-duration: estimated-duration,
+        bid-block: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (accept-service-bid (job-id uint) (provider principal))
+  (let ((job-data (unwrap! (map-get? repair-jobs { job-id: job-id }) err-not-found))
+        (bid-data (unwrap! (map-get? service-bids { job-id: job-id, provider: provider }) err-not-found)))
+    (asserts! (is-eq tx-sender (get customer job-data)) err-unauthorized)
+    (asserts! (is-eq (get status job-data) "open") err-job-not-available)
+    (map-set repair-jobs
+      { job-id: job-id }
+      (merge job-data { status: "assigned", selected-provider: (some provider) })
+    )
+    (ok true)
   )
 )
