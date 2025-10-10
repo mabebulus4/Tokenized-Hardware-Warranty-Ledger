@@ -10,6 +10,10 @@
 (define-constant err-job-not-available (err u107))
 (define-constant err-invalid-bid (err u108))
 
+(define-constant err-already-rated (err u109))
+(define-constant err-cannot-rate (err u110))
+(define-constant err-invalid-rating (err u111))
+
 (define-non-fungible-token warranty-token uint)
 
 (define-data-var warranty-counter uint u0)
@@ -304,5 +308,79 @@
       (merge job-data { status: "assigned", selected-provider: (some provider) })
     )
     (ok true)
+  )
+)
+
+
+(define-map manufacturer-reputation
+  { manufacturer: principal }
+  {
+    total-ratings: uint,
+    rating-sum: uint,
+    average-rating: uint
+  }
+)
+
+(define-map warranty-ratings
+  { warranty-id: uint }
+  {
+    rating: uint,
+    comment: (string-ascii 150),
+    rater: principal,
+    rating-block: uint,
+    has-been-rated: bool
+  }
+)
+
+(define-read-only (get-manufacturer-reputation (manufacturer principal))
+  (default-to 
+    { total-ratings: u0, rating-sum: u0, average-rating: u0 }
+    (map-get? manufacturer-reputation { manufacturer: manufacturer })
+  )
+)
+
+(define-read-only (get-warranty-rating (warranty-id uint))
+  (map-get? warranty-ratings { warranty-id: warranty-id })
+)
+
+(define-public (rate-warranty (warranty-id uint) (rating uint) (comment (string-ascii 150)))
+  (let (
+    (warranty-data (unwrap! (get-warranty warranty-id) err-not-found))
+    (current-owner (unwrap! (get-warranty-owner warranty-id) err-not-found))
+    (existing-rating (map-get? warranty-ratings { warranty-id: warranty-id }))
+  )
+    (asserts! (is-eq tx-sender current-owner) err-unauthorized)
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+    (asserts! (or (not (get is-active warranty-data)) (unwrap! (is-warranty-expired warranty-id) err-not-found)) err-cannot-rate)
+    (asserts! (is-none existing-rating) err-already-rated)
+    
+    (map-set warranty-ratings
+      { warranty-id: warranty-id }
+      {
+        rating: rating,
+        comment: comment,
+        rater: tx-sender,
+        rating-block: stacks-block-height,
+        has-been-rated: true
+      }
+    )
+    
+    (let (
+      (manufacturer (get manufacturer warranty-data))
+      (current-rep (get-manufacturer-reputation manufacturer))
+      (new-total (+ (get total-ratings current-rep) u1))
+      (new-sum (+ (get rating-sum current-rep) rating))
+      (new-average (/ new-sum new-total))
+    )
+      (map-set manufacturer-reputation
+        { manufacturer: manufacturer }
+        {
+          total-ratings: new-total,
+          rating-sum: new-sum,
+          average-rating: new-average
+        }
+      )
+      (ok new-average)
+    )
   )
 )
