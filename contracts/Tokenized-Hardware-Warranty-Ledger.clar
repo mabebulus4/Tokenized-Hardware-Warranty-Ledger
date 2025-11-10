@@ -14,6 +14,11 @@
 (define-constant err-cannot-rate (err u110))
 (define-constant err-invalid-rating (err u111))
 
+(define-constant err-insufficient-funds (err u112))
+(define-constant err-escrow-not-found (err u113))
+(define-constant err-job-not-completed (err u114))
+(define-constant err-already-disputed (err u115))
+
 (define-non-fungible-token warranty-token uint)
 
 (define-data-var warranty-counter uint u0)
@@ -382,5 +387,91 @@
       )
       (ok new-average)
     )
+  )
+)
+
+(define-map job-escrow
+  { job-id: uint }
+  {
+    deposited-amount: uint,
+    depositor: principal,
+    is-deposited: bool,
+    is-disputed: bool,
+    dispute-reason: (string-ascii 150),
+    arbiter-decision: (optional bool)
+  }
+)
+
+(define-read-only (get-escrow-status (job-id uint))
+  (map-get? job-escrow { job-id: job-id })
+)
+
+(define-public (deposit-to-escrow (job-id uint) (amount uint))
+  (let ((job-data (unwrap! (map-get? repair-jobs { job-id: job-id }) err-not-found)))
+    (asserts! (is-eq tx-sender (get customer job-data)) err-unauthorized)
+    (asserts! (is-eq (get status job-data) "assigned") err-job-not-available)
+    (asserts! (>= amount (get max-budget job-data)) err-insufficient-funds)
+    (asserts! (is-none (map-get? job-escrow { job-id: job-id })) err-already-exists)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set job-escrow
+      { job-id: job-id }
+      {
+        deposited-amount: amount,
+        depositor: tx-sender,
+        is-deposited: true,
+        is-disputed: false,
+        dispute-reason: "",
+        arbiter-decision: none
+      }
+    )
+    (map-set repair-jobs { job-id: job-id } (merge job-data { status: "in-progress" }))
+    (ok true)
+  )
+)
+
+(define-public (complete-job-and-release (job-id uint))
+  (let (
+    (job-data (unwrap! (map-get? repair-jobs { job-id: job-id }) err-not-found))
+    (escrow-data (unwrap! (map-get? job-escrow { job-id: job-id }) err-escrow-not-found))
+    (provider (unwrap! (get selected-provider job-data) err-not-found))
+  )
+    (asserts! (is-eq tx-sender (get customer job-data)) err-unauthorized)
+    (asserts! (is-eq (get status job-data) "in-progress") err-job-not-available)
+    (asserts! (not (get is-disputed escrow-data)) err-already-disputed)
+    (try! (as-contract (stx-transfer? (get deposited-amount escrow-data) tx-sender provider)))
+    (map-set repair-jobs { job-id: job-id } (merge job-data { status: "completed", completion-block: (some stacks-block-height) }))
+    (ok true)
+  )
+)
+
+(define-public (raise-dispute (job-id uint) (reason (string-ascii 150)))
+  (let (
+    (job-data (unwrap! (map-get? repair-jobs { job-id: job-id }) err-not-found))
+    (escrow-data (unwrap! (map-get? job-escrow { job-id: job-id }) err-escrow-not-found))
+  )
+    (asserts! (is-eq tx-sender (get customer job-data)) err-unauthorized)
+    (asserts! (get is-deposited escrow-data) err-escrow-not-found)
+    (asserts! (not (get is-disputed escrow-data)) err-already-disputed)
+    (map-set job-escrow { job-id: job-id } (merge escrow-data { is-disputed: true, dispute-reason: reason }))
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute (job-id uint) (favor-customer bool))
+  (let (
+    (job-data (unwrap! (map-get? repair-jobs { job-id: job-id }) err-not-found))
+    (escrow-data (unwrap! (map-get? job-escrow { job-id: job-id }) err-escrow-not-found))
+    (provider (unwrap! (get selected-provider job-data) err-not-found))
+    (customer (get customer job-data))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get is-disputed escrow-data) err-invalid-warranty)
+    (if favor-customer
+      (try! (as-contract (stx-transfer? (get deposited-amount escrow-data) tx-sender customer)))
+      (try! (as-contract (stx-transfer? (get deposited-amount escrow-data) tx-sender provider)))
+    )
+    (map-set job-escrow { job-id: job-id } (merge escrow-data { arbiter-decision: (some favor-customer) }))
+    (map-set repair-jobs { job-id: job-id } (merge job-data { status: "disputed-resolved" }))
+    (ok favor-customer)
   )
 )
